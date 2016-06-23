@@ -1,5 +1,5 @@
-KERNELDIR ?= /lib/modules/$(shell uname -r)/build
-#KERNELDIR=/home/redha/m2/nmv/linux-4.2.3
+#KERNELDIR ?= /lib/modules/$(shell uname -r)/build
+KERNELDIR=/home/redha/m2/nmv/linux-4.2.3
 PWD := $(shell pwd)
 
 obj-m := core_regulator.o
@@ -14,6 +14,6 @@ clean:
 	rm -rf *~ *#
 
 send: core_regulator.ko
-	cp $^ /home/redha/m2/nmv/myHome/
+	scp -P10022 $^ root@localhost:
 
 .PHONY: all clean send
