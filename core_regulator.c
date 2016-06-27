@@ -11,7 +11,11 @@
 #include <linux/slab.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/cdev.h>
 #include <asm-generic/delay.h>
+#include <linux/spinlock.h>
+
+#include "ioctl.h"
 
 MODULE_DESCRIPTION("Core-level regulator");
 MODULE_AUTHOR("Redha Gouicem <redha.gouicem@gmail.com>");
@@ -19,6 +23,8 @@ MODULE_LICENSE("GPL");
 
 #define PROCFS_DIRNAME "core_regulator"
 #define STOP_DURATION_US 1000000
+#define DEFAULT_PERIOD_US 100
+#define DEFAULT_NR_SAMPLES 100000
 
 
 /****************************************
@@ -47,6 +53,14 @@ struct core {
 	enum state state;                   /* core's current state */
 };
 
+struct process {
+	pid_t pid;                          /* process id */
+	struct core *core;                  /* core where process runs */
+	u64 nr_runs;                        /* number of times process ran */
+	struct timespec best_exec_time;     /* best execution time so far */
+	struct timespec last_start;         /* last starting date */
+};
+
 
 /****************************************
  * Function prototypes
@@ -67,11 +81,11 @@ static void cancel_hrtimer(void *arg);
  * Global variables
  ***************************************/
 static struct core __percpu *core;
-static unsigned int period = 100;           /* sampling period in useconds */
-static ktime_t kt_period;                   /* period in a ktime_t */
-static unsigned int nr_samples = 10000;     /* max number of stored samples */
-static struct proc_dir_entry *proc_dir;     /* procfs directory */
-static struct file_operations fops_seq = {  /* procfs data structures */
+static unsigned int period = DEFAULT_PERIOD_US;      /* sampling period in useconds */
+static ktime_t kt_period;                            /* period in a ktime_t */
+static unsigned int nr_samples = DEFAULT_NR_SAMPLES; /* max number of stored samples */
+static struct proc_dir_entry *proc_dir;              /* procfs directory */
+static struct file_operations fops_seq = {           /* procfs data structures */
     .owner   = THIS_MODULE,
     .open    = proc_open,
     .read    = seq_read,
@@ -85,18 +99,23 @@ static struct seq_operations seqops = {
     .show  = proc_show
 };
 static char *info_buffer;
-struct file_operations fops_info;
-struct file_operations fops_ctrl;
+static struct file_operations fops_info;
+static struct file_operations fops_ctrl;
+static struct cdev *device;                /* device for ioctl */
+static int dev_major;                      /* device major number */
+static struct file_operations fops_ioctl;  /* fops for ioctl */
+static struct process rt_proc;             /* process that has high priority */
 
 
 /****************************************
  * Module parameters
  ***************************************/
 module_param(period, uint, 0444);
-MODULE_PARM_DESC(period, "Sampling period in usec (default: 100)");
+MODULE_PARM_DESC(period, "Sampling period in usec \
+(default: 100)");
 module_param(nr_samples, uint, 0444);
 MODULE_PARM_DESC(nr_samples, "Maximum number of samples stored in memory \
-(default: 10000)");
+(default: 100000)");
 
 
 /****************************************
@@ -405,6 +424,132 @@ static void cleanup_procfs(void)
 	kfree(info_buffer);
 }
 
+static int open_ioctl(struct inode *inode, struct file *filp)
+{
+	pr_debug("device opened\n");
+	return 0;
+}
+
+static int release_ioctl(struct inode *inode, struct file *filp)
+{
+	pr_debug("device closed\n");
+	return 0;
+}
+
+static long ioctl_funcs(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	int ret = 0;
+	struct ioctl_data *data = (struct ioctl_data *) arg;
+	struct timespec end, exec, zero;
+	struct pid *pid;
+	struct task_struct *task;
+
+	switch(cmd) {
+	case IOCTL_REGISTER:
+		rt_proc.pid = data->pid;
+		pr_info("ioctl pid supplied: %d\n", rt_proc.pid);
+		rt_proc.nr_runs = 0;
+		rt_proc.best_exec_time = ns_to_timespec(0);
+		rt_proc.last_start = ns_to_timespec(0);
+		pid = find_get_pid(rt_proc.pid);
+		if (pid == NULL) {
+			pr_warn("wrong pid supplied through ioctl\n");
+			return -1;
+		}
+		task = get_pid_task(pid, PIDTYPE_PID);
+		if (task == NULL) {
+			pr_warn("error handling ioctl\n");
+			put_pid(pid);
+			return -1;
+		}
+		rt_proc.core = per_cpu_ptr(core, task_cpu(task));
+		put_task_struct(task);
+		put_pid(pid);
+		break;
+	case IOCTL_UNREGISTER:
+		rt_proc.pid = 0;
+		rt_proc.core = NULL;
+		break;
+	case IOCTL_START:
+		if (rt_proc.pid < 1) {
+			pr_warn("cannot use START if not registered\n");
+		        return -1;
+		}
+		rt_proc.nr_runs++;
+		getnstimeofday(&(rt_proc.last_start));
+		break;
+	case IOCTL_STOP:
+		getnstimeofday(&end);
+		if (rt_proc.pid < 1) {
+			pr_warn("cannot use STOP if not registered\n");
+		        return -1;
+		}
+		exec = timespec_sub(end, rt_proc.last_start);
+		ret = copy_to_user(&(data->time), &exec,
+				   sizeof(struct timespec));
+		if (ret != 0) {
+			pr_warn("copy_to_user() failed: ret = %d\n", ret);
+			return -1;
+		}
+		zero = ns_to_timespec(0);
+		if ((timespec_compare(&(rt_proc.best_exec_time), &zero) == 0) ||
+		    (timespec_compare(&exec, &(rt_proc.best_exec_time)) < 0))
+			rt_proc.best_exec_time = exec;
+		break;
+	default:
+		pr_warn("wrong ioctl command\n");
+		ret = -1;
+	}
+
+	return ret;
+}
+
+static int setup_ioctl(void)
+{
+	int ret;
+	dev_t dev_no, dev;
+
+	fops_ioctl.open = open_ioctl;
+	fops_ioctl.release = release_ioctl;
+	fops_ioctl.unlocked_ioctl = ioctl_funcs;
+
+	device = cdev_alloc();
+	if (device == NULL) {
+		pr_warn("device allocation failed\n");
+		ret = -1;
+		goto err;
+	}
+	device->owner = THIS_MODULE;
+	device->ops = &fops_ioctl;
+	dev_no = MKDEV(246, 0);
+	ret = register_chrdev_region(dev_no, 1, IOCTL_DEVNAME);
+	//ret = alloc_chrdev_region(&dev_no, 0, 1, IOCTL_DEVNAME);
+	if (ret < 0) {
+		pr_warn("device allocation failed\n");
+		goto err;
+	}
+
+	dev_major = MAJOR(dev_no);
+	dev = MKDEV(dev_major, 0);
+	pr_info("device major number = %d", dev_major);
+	ret = cdev_add(device, dev, 1);
+	if (ret < 0) {
+		pr_warn("device allocation failed\n");
+		goto err;
+	}
+
+	return 0;
+
+err:
+	return ret;
+}
+
+static void cleanup_ioctl(void)
+{
+	cdev_del(device);
+	unregister_chrdev_region(dev_major, 1);
+}
+
 static struct perf_event *init_counter(int cpu, int event_type, int event_id)
 {
 	long err;
@@ -569,7 +714,6 @@ static void init_hrtimer(void *arg)
 	hrtimer_init(&(c->timer), CLOCK_MONOTONIC_RAW,
 		     HRTIMER_MODE_REL_PINNED);
 	c->timer.function = timer_handler;
-	hrtimer_start(&(c->timer), c->period, HRTIMER_MODE_REL_PINNED);
 }
 
 static void cancel_hrtimer(void *arg)
@@ -605,18 +749,28 @@ int init_module(void)
 	/* Convert uint period to ktime_t period */
 	kt_period = ktime_set(0, 1000 * period);
 
+	/* Initialize current rt proc */
+	rt_proc.pid = 0;
+	rt_proc.core = NULL;
+	rt_proc.nr_runs = 0;
+	rt_proc.best_exec_time = ns_to_timespec(0);
+	rt_proc.last_start = ns_to_timespec(0);
+
 	/* Alloc data for each CPU */
 	core = alloc_percpu(struct core);
 
 	/* procfs setup */
 	setup_procfs();
 
+	/* ioctl setup */
+	setup_ioctl();
+
 	/* On each CPU, initialize counters and timers */
 	get_online_cpus();
 	for_each_online_cpu(cpu) {
 		c             = per_cpu_ptr(core, cpu);
 		c->id         = cpu;
-		c->function   = profile;
+		c->function   = NULL;
 		c->period     = kt_period;
 		c->slow_rate  = 50;
 		c->miss       = NULL;
@@ -627,7 +781,8 @@ int init_module(void)
 		c->state      = RUNNING;
 	}
 	for_each_online_cpu(cpu) {
-		c          = per_cpu_ptr(core, cpu);
+		c = per_cpu_ptr(core, cpu);
+
 		/* Allocate memory for samples */
 		c->samples = kmalloc_array(nr_samples, sizeof(struct sample),
 					   GFP_KERNEL);
@@ -692,6 +847,8 @@ void cleanup_module(void)
 		kfree(c->samples);
 	}
 	put_online_cpus();
+
+	cleanup_ioctl();
 
 	cleanup_procfs();
 
