@@ -25,17 +25,23 @@ MODULE_LICENSE("GPL");
 #define STOP_DURATION_US 1000000
 #define DEFAULT_PERIOD_US 100
 #define DEFAULT_NR_SAMPLES 100000
+#define EVENT_STR_LEN 10
 
 
 /****************************************
  * Type definitions
  ***************************************/
-enum state {UNKNOWN, RUNNING, PROFILING, CONTROLING, SLOWING_DOWN, STOPPED};
+enum state {UNKNOWN, RUNNING, PROFILING, CONTROLING,
+	    SLOWING_DOWN, SLOWING_DOWN_PROF, STOPPED};
+enum event {NONE, REGISTER_APP, START_APP, STOP_APP, UNREGISTER_APP,
+	    PROF, RUN, SLOW, STOP, SLOW_INT};
 
 struct sample {
-	u64 write;                 /* write count for this period */
-	u64 miss;                  /* miss count for this period */
-	struct timespec timestamp; /* sample timestamp */
+	u64 write;                          /* write count for this period */
+	u64 miss;                           /* miss count for this period */
+	struct timespec timestamp;          /* sample timestamp */
+	enum event event;                   /* event */
+	int event_value;                    /* value associated with event */
 };
 
 struct core {
@@ -49,6 +55,7 @@ struct core {
 	struct sample *samples;             /* samples */
 	unsigned int cur_id;                /* current sample ID (write) */
 	unsigned int read_id;               /* current sample ID (read) */
+	spinlock_t samples_lock;            /* spinlock for writes in samples */
 	struct proc_dir_entry *proc_entry;  /* procfs entry */
 	enum state state;                   /* core's current state */
 };
@@ -73,8 +80,10 @@ static int proc_show(struct seq_file *m, void *v);
 static void profile(void);
 static void stop(void);
 static void slowdown(void);
+static void slowdown_prof(void);
 static void start_hrtimer(void *arg);
 static void cancel_hrtimer(void *arg);
+static void add_event(void *arg);
 
 
 /****************************************
@@ -101,7 +110,7 @@ static struct seq_operations seqops = {
 static char *info_buffer;
 static struct file_operations fops_info;
 static struct file_operations fops_ctrl;
-static struct cdev *device;                /* device for ioctl */
+/* static struct cdev *device;                /\* device for ioctl *\/ */
 static int dev_major;                      /* device major number */
 static struct file_operations fops_ioctl;  /* fops for ioctl */
 static struct process rt_proc;             /* process that has high priority */
@@ -122,21 +131,46 @@ MODULE_PARM_DESC(nr_samples, "Maximum number of samples stored in memory \
  * Code
  ***************************************/
 
-#define state_to_str(state)					\
-	(state) == RUNNING ? "RUNNING" :			\
-		(state) == PROFILING ? "PROFILING" :		\
-		(state) == CONTROLING ? "CONTROLING" :		\
-		(state) == SLOWING_DOWN ? "SLOWING_DOWN" :	\
-		(state) == STOPPED ? "STOPPED" :		\
+#define state_to_str(state)						\
+	(state) == RUNNING ? "RUNNING" :				\
+		(state) == PROFILING ? "PROFILING" :			\
+		(state) == CONTROLING ? "CONTROLING" :			\
+		(state) == SLOWING_DOWN ? "SLOWING_DOWN" :		\
+		(state) == SLOWING_DOWN_PROF ? "SLOWING_DOWN_PROF" :	\
+		(state) == STOPPED ? "STOPPED" :			\
 		"UNKNOWN"
 
-#define str_to_state(str)						\
-	strcmp((str), "RUNNING") == 0 ? RUNNING :			\
-		strcmp((str), "PROFILING") == 0 ? PROFILING :		\
-		strcmp((str), "CONTROLING") == 0 ? CONTROLING :		\
-		strcmp((str), "SLOWING_DOWN") == 0 ? SLOWING_DOWN :	\
-		strcmp((str), "STOPPED") == 0 ? STOPPED :		\
+#define str_to_state(str)						      \
+	strcmp((str), "RUNNING") == 0 ? RUNNING :			      \
+		strcmp((str), "PROFILING") == 0 ? PROFILING :		      \
+		strcmp((str), "CONTROLING") == 0 ? CONTROLING :		      \
+		strcmp((str), "SLOWING_DOWN") == 0 ? SLOWING_DOWN :	      \
+		strcmp((str), "SLOWING_DOWN_PROF") == 0 ? SLOWING_DOWN_PROF : \
+		strcmp((str), "STOPPED") == 0 ? STOPPED :		      \
 		UNKNOWN
+
+#define event_to_str(event)					\
+	(event) == REGISTER_APP ? "REGISTER_APP" :		\
+		(event) == START_APP ? "START_APP" :		\
+		(event) == STOP_APP ? "STOP_APP" :		\
+		(event) == UNREGISTER_APP ? "UNREGISTER_APP" :	\
+		(event) == PROF ? "PROF" :			\
+		(event) == RUN ? "RUN" :			\
+		(event) == SLOW ? "SLOW " :			\
+		(event) == SLOW_INT ? "SLOW_INT" :		\
+		(event) == STOP ? "STOP" :			\
+		""
+
+#define str_to_event(str)						\
+	strcmp((str), "REGISTER_APP") == 0 ? REGISTER_APP :		\
+		strcmp((str), "START_APP") == 0 ? START_APP :		\
+		strcmp((str), "STOP_APP") == 0 ? STOP_APP :		\
+		strcmp((str), "UNREGISTER_APP") == 0 ? UNREGISTER_APP :	\
+		strcmp((str), "PROF") == 0 ? PROF :			\
+		strcmp((str), "RUN") == 0 ? RUN :			\
+		strcmp((str), "SLOW") == 0 ? SLOW :			\
+		strcmp((str), "STOP") == 0 ? STOP :			\
+		NONE
 
 static int proc_open(struct inode *inode, struct file *file)
 {
@@ -196,14 +230,22 @@ static int proc_show(struct seq_file *m, void *v)
 	struct sample *s;
 
 	if (unlikely(v == SEQ_START_TOKEN)) {
-		seq_printf(m, "timestamp (s) ; write ; miss\n");
+		seq_printf(m, "timestamp (s) ; write ; miss ; event\n");
 		return 0;
 	}
 
 	s = (struct sample *) v;
-	seq_printf(m, "%ld.%9ld ; %llu ; %llu\n",
-		   s->timestamp.tv_sec, s->timestamp.tv_nsec,
-		   s->write, s->miss);
+	if (s->event == SLOW || s->event == SLOW_INT ||
+	    s->event == REGISTER_APP) {
+		seq_printf(m, "%ld.%09ld ; %llu ; %llu ; %s %d\n",
+			   s->timestamp.tv_sec, s->timestamp.tv_nsec,
+			   s->write, s->miss, event_to_str(s->event),
+			   s->event_value);
+	} else {
+		seq_printf(m, "%ld.%09ld ; %llu ; %llu ; %s\n",
+			   s->timestamp.tv_sec, s->timestamp.tv_nsec,
+			   s->write, s->miss, event_to_str(s->event));
+	}
 
 	return 0;
 }
@@ -250,6 +292,8 @@ static ssize_t write_ctrl_proc(struct file *file, const char __user *buffer,
 	struct core *c;
 	cpumask_t mask;
 	unsigned int slow_rate, str_padding;
+	struct sample s;
+	bool prof;
 	
 	kbuf = kzalloc(count, GFP_KERNEL);
 	if (kbuf == NULL)
@@ -259,12 +303,15 @@ static ssize_t write_ctrl_proc(struct file *file, const char __user *buffer,
 	if (IS_ERR_VALUE(ret)) {
 		goto err;
 	}
+
+	pr_warn("ioctl command: '%s'\n", kbuf);
 	
 	if (strncmp(kbuf, "profile ", strlen("profile ")) == 0) {
 		err = cpumask_parse(kbuf + strlen("profile "), &mask);
 		if (IS_ERR_VALUE(err)) {
 			ret = err;
-			pr_debug("cpumask_parse failed: '%s'\n", kbuf + strlen("profile "));
+			pr_debug("cpumask_parse failed: '%s'\n",
+				 kbuf + strlen("profile "));
 			goto err;
 		}
 		get_online_cpus();
@@ -272,9 +319,14 @@ static ssize_t write_ctrl_proc(struct file *file, const char __user *buffer,
 			c = per_cpu_ptr(core, cpu);
 			c->function = profile;
 			c->period   = kt_period;
+			s.miss  = 0;
+			s.write = 0;
+			s.event = PROF;
+			smp_call_function_single(cpu, add_event, &s, 1);
 			if (!hrtimer_active(&(c->timer))) {
 				pr_debug("start timer %d\n", cpu);
-			        smp_call_function_single(cpu, start_hrtimer, NULL, 1);
+			        smp_call_function_single(cpu, start_hrtimer,
+							 NULL, 1);
 			}
 		}
 		put_online_cpus();
@@ -290,10 +342,15 @@ static ssize_t write_ctrl_proc(struct file *file, const char __user *buffer,
 			c = per_cpu_ptr(core, cpu);
 		        if (hrtimer_active(&(c->timer))) {
 				pr_debug("cancel timer %d\n", cpu);
-				smp_call_function_single(cpu, cancel_hrtimer, NULL, 1);
+				smp_call_function_single(cpu, cancel_hrtimer,
+							 NULL, 1);
 			}
 			c->function = NULL;
 			c->state = RUNNING;
+			s.miss  = 0;
+			s.write = 0;
+			s.event = RUN;
+			smp_call_function_single(cpu, add_event, &s, 1);
 		}
 		put_online_cpus();
 	} else if (strncmp(kbuf, "stop ", strlen("stop ")) == 0) {
@@ -308,6 +365,10 @@ static ssize_t write_ctrl_proc(struct file *file, const char __user *buffer,
 			c = per_cpu_ptr(core, cpu);
 			c->function = stop;
 			c->period   = ktime_set(0, STOP_DURATION_US + 50);
+			s.miss  = 0;
+			s.write = 0;
+			s.event = STOP;
+			smp_call_function_single(cpu, add_event, &s, 1);
 			if (!hrtimer_active(&(c->timer))) {
 				pr_debug("start timer %d\n", cpu);
 			        smp_call_function_single(cpu, start_hrtimer, NULL, 1);
@@ -315,7 +376,17 @@ static ssize_t write_ctrl_proc(struct file *file, const char __user *buffer,
 		}
 		put_online_cpus();
 	} else if (strncmp(kbuf, "slow ", strlen("slow ")) == 0) {
-		if (sscanf(kbuf, "slow %u", &slow_rate) != 1) {
+		prof = false;
+		if (strncmp(kbuf + strlen("slow "), "prof ", strlen("prof ")) == 0)
+			prof = true;
+		if (prof) {
+			pr_info("slow prof\n");
+			ret = sscanf(kbuf, "slow prof %u", &slow_rate);
+		} else {
+			pr_info("slow\n");
+			ret = sscanf(kbuf, "slow %u", &slow_rate);
+		}
+		if (ret != 1) {
 			ret = -EINVAL;
 			pr_warn("wrong slow value\n");
 			goto err;
@@ -327,28 +398,44 @@ static ssize_t write_ctrl_proc(struct file *file, const char __user *buffer,
 		}
 		str_padding = slow_rate < 10 ? 1 :	\
 			slow_rate < 100 ? 2 : 3;
-		err = cpumask_parse(kbuf + strlen("slow  ") + str_padding, &mask);
+		if (prof)
+			err = cpumask_parse(kbuf + strlen("slow prof  ") + str_padding, &mask);
+		else
+			err = cpumask_parse(kbuf + strlen("slow  ") + str_padding, &mask);
 		if (IS_ERR_VALUE(err)) {
 			ret = err;
-			pr_debug("cpumask_parse failed: '%s'\n", kbuf + strlen("slow "));
+			pr_debug("cpumask_parse failed: '%s'\n",
+				 kbuf + strlen("slow "));
 			goto err;
 		}
 		get_online_cpus();
 		for_each_cpu_and(cpu, cpu_online_mask, &mask) {
 			c = per_cpu_ptr(core, cpu);
-			c->function  = slowdown;
+			if (prof)
+				c->function = slowdown_prof;
+			else
+				c->function = slowdown;
 			c->period    = kt_period;
 			c->slow_rate = slow_rate;
+			s.miss  = 0;
+			s.write = 0;
+			s.event = SLOW;
+			s.event_value = slow_rate;
+			smp_call_function_single(cpu, add_event, &s, 1);
 			pr_debug("slowdown delays = %llu us\n",
 				 ((ktime_to_ns(c->period) / 1000) * c->slow_rate) / 100);
 			if (!hrtimer_active(&(c->timer))) {
 				pr_debug("start timer %d\n", cpu);
-			        smp_call_function_single(cpu, start_hrtimer, NULL, 1);
+			        smp_call_function_single(cpu, start_hrtimer,
+							 NULL, 1);
 			}
 		}
 		put_online_cpus();
+	} else if (strncmp(kbuf, "", count) == 0) {
+		ret = count;
+		goto err;
 	} else {
-		pr_warn("unknown control command\n");
+		pr_warn("unknown control command: '%s'\n", kbuf);
 		ret = -EINVAL;
 		goto err;
 	}
@@ -443,10 +530,17 @@ static long ioctl_funcs(struct file *filp, unsigned int cmd, unsigned long arg)
 	struct timespec end, exec, zero;
 	struct pid *pid;
 	struct task_struct *task;
+	struct sample s;
 
 	switch(cmd) {
 	case IOCTL_REGISTER:
-		rt_proc.pid = data->pid;
+		ret = copy_from_user(&(rt_proc.pid), &(data->pid),
+				     sizeof(pid_t));
+		if (ret != 0) {
+			pr_warn("copy_from_user() failed: ret = %d\n", ret);
+			return -1;
+		}
+		//rt_proc.pid = data->pid;
 		pr_info("ioctl pid supplied: %d\n", rt_proc.pid);
 		rt_proc.nr_runs = 0;
 		rt_proc.best_exec_time = ns_to_timespec(0);
@@ -465,8 +559,18 @@ static long ioctl_funcs(struct file *filp, unsigned int cmd, unsigned long arg)
 		rt_proc.core = per_cpu_ptr(core, task_cpu(task));
 		put_task_struct(task);
 		put_pid(pid);
+		s.miss  = 0;
+		s.write = 0;
+		s.event = REGISTER_APP;
+		s.event_value = rt_proc.pid;
+		smp_call_function_single(smp_processor_id(), add_event, &s, 1);
 		break;
 	case IOCTL_UNREGISTER:
+		s.miss  = 0;
+		s.write = 0;
+		s.event = UNREGISTER_APP;
+		s.event_value = rt_proc.pid;
+		smp_call_function_single(smp_processor_id(), add_event, &s, 1);
 		rt_proc.pid = 0;
 		rt_proc.core = NULL;
 		break;
@@ -476,6 +580,10 @@ static long ioctl_funcs(struct file *filp, unsigned int cmd, unsigned long arg)
 		        return -1;
 		}
 		rt_proc.nr_runs++;
+		s.miss  = 0;
+		s.write = 0;
+		s.event = START_APP;
+		smp_call_function_single(smp_processor_id(), add_event, &s, 1);
 		getnstimeofday(&(rt_proc.last_start));
 		break;
 	case IOCTL_STOP:
@@ -495,6 +603,10 @@ static long ioctl_funcs(struct file *filp, unsigned int cmd, unsigned long arg)
 		if ((timespec_compare(&(rt_proc.best_exec_time), &zero) == 0) ||
 		    (timespec_compare(&exec, &(rt_proc.best_exec_time)) < 0))
 			rt_proc.best_exec_time = exec;
+		s.miss  = 0;
+		s.write = 0;
+		s.event = STOP_APP;
+		smp_call_function_single(smp_processor_id(), add_event, &s, 1);
 		break;
 	default:
 		pr_warn("wrong ioctl command\n");
@@ -507,47 +619,53 @@ static long ioctl_funcs(struct file *filp, unsigned int cmd, unsigned long arg)
 static int setup_ioctl(void)
 {
 	int ret;
-	dev_t dev_no, dev;
+	/* dev_t dev_no, dev; */
+	unsigned int major = 225;
 
+	fops_ioctl.owner = THIS_MODULE;
 	fops_ioctl.open = open_ioctl;
 	fops_ioctl.release = release_ioctl;
 	fops_ioctl.unlocked_ioctl = ioctl_funcs;
 
-	device = cdev_alloc();
-	if (device == NULL) {
-		pr_warn("device allocation failed\n");
-		ret = -1;
-		goto err;
-	}
-	device->owner = THIS_MODULE;
-	device->ops = &fops_ioctl;
-	dev_no = MKDEV(246, 0);
-	ret = register_chrdev_region(dev_no, 1, IOCTL_DEVNAME);
+	/* device = cdev_alloc(); */
+	/* if (device == NULL) { */
+	/* 	pr_warn("device allocation failed\n"); */
+	/* 	ret = -1; */
+	/* 	goto err; */
+	/* } */
+	/* device->owner = THIS_MODULE; */
+	/* device->ops = &fops_ioctl; */
+	/* dev_no = MKDEV(227, 0); */
+	/* ret = register_chrdev_region(dev_no, 1, IOCTL_DEVNAME); */
+	ret = __register_chrdev(major, 0, 1, IOCTL_DEVNAME, &fops_ioctl);
 	//ret = alloc_chrdev_region(&dev_no, 0, 1, IOCTL_DEVNAME);
 	if (ret < 0) {
-		pr_warn("device allocation failed\n");
-		goto err;
+		pr_err("device allocation failed\n");
+		return ret;
 	}
 
-	dev_major = MAJOR(dev_no);
-	dev = MKDEV(dev_major, 0);
+	dev_major = (major == 0) ? ret : major;
+
+	/* dev_major = MAJOR(dev_no); */
+	/* dev = MKDEV(dev_major, 0); */
 	pr_info("device major number = %d", dev_major);
-	ret = cdev_add(device, dev, 1);
-	if (ret < 0) {
-		pr_warn("device allocation failed\n");
-		goto err;
-	}
+	/* ret = cdev_add(device, dev, 1); */
+	/* if (ret < 0) { */
+	/* 	pr_warn("device allocation failed\n"); */
+	/* 	goto err; */
+	/* } */
 
 	return 0;
 
-err:
-	return ret;
+/* err: */
+/* 	return ret; */
 }
 
 static void cleanup_ioctl(void)
 {
-	cdev_del(device);
-	unregister_chrdev_region(dev_major, 1);
+	//cdev_del(device);
+	//unregister_chrdev_region(dev_major, 1);
+	__unregister_chrdev(dev_major, 0, 1, IOCTL_DEVNAME);
 }
 
 static struct perf_event *init_counter(int cpu, int event_type, int event_id)
@@ -642,14 +760,45 @@ static void disable_counters(void)
 	put_online_cpus();
 }
 
-static void slowdown(void)
+static void slowdown_prof(void)
 {
 	struct core *c = this_cpu_ptr(core);
+	/* struct sample s; */
+	/* struct timespec a, b, d; */
 	u64 delay;
 
+	/* getnstimeofday(&a); */
+	profile();
 	c->state = SLOWING_DOWN;
 	delay = ((ktime_to_ns(c->period) / 1000) * c->slow_rate) / 100;
 	udelay(delay);
+	/* getnstimeofday(&b); */
+	/* d = timespec_sub(b, a); */
+	/* s.miss  = 0; */
+	/* s.write = 0; */
+	/* s.event = SLOW_INT; */
+	/* s.event_value = timespec_to_ns(&d); */
+	/* add_event(&s); */
+}
+
+static void slowdown(void)
+{
+	struct core *c = this_cpu_ptr(core);
+	/* struct sample s; */
+	/* struct timespec a, b, d; */
+	u64 delay;
+
+	/* getnstimeofday(&a); */
+	c->state = SLOWING_DOWN;
+	delay = ((ktime_to_ns(c->period) / 1000) * c->slow_rate) / 100;
+	udelay(delay);
+	/* getnstimeofday(&b); */
+	/* d = timespec_sub(b, a); */
+	/* s.miss  = 0; */
+	/* s.write = 0; */
+	/* s.event = SLOW_INT; */
+	/* s.event_value = timespec_to_ns(&d); */
+	/* add_event(&s); */
 }
 
 static void stop(void)
@@ -668,23 +817,49 @@ static void stop(void)
 static void profile(void)
 {
 	struct core *c = this_cpu_ptr(core);
+	unsigned long flags;
 
+	spin_lock_irqsave(&(c->samples_lock), flags);
 	c->state = PROFILING;
-	/* c->miss->pmu->stop(c->miss, PERF_EF_UPDATE); */
-	/* c->write->pmu->stop(c->write, PERF_EF_UPDATE); */
+	c->miss->pmu->stop(c->miss, PERF_EF_UPDATE);
+	c->write->pmu->stop(c->write, PERF_EF_UPDATE);
 
+	getnstimeofday(&(c->samples[c->cur_id].timestamp));
+	c->samples[c->cur_id].miss  = local64_read(&(c->miss)->count);
+	c->samples[c->cur_id].write = local64_read(&(c->write)->count);
+	c->samples[c->cur_id].event = NONE;
+	c->cur_id = (c->cur_id + 1) % nr_samples;
+
+	local64_set(&(c->miss)->count, 0);
+	local64_set(&(c->write)->count, 0);
+
+	c->miss->pmu->start(c->miss, PERF_EF_RELOAD);
+	c->write->pmu->start(c->write, PERF_EF_RELOAD);
+	
 	/* getnstimeofday(&(c->samples[c->cur_id].timestamp)); */
-	/* c->samples[c->cur_id].miss  = local64_read(&(c->miss)->count); */
-	/* c->samples[c->cur_id].write = local64_read(&(c->write)->count); */
+	/* c->samples[c->cur_id].miss = c->cur_id; */
+	/* c->samples[c->cur_id].write = c->cur_id + 1; */
 	/* c->cur_id = (c->cur_id + 1) % nr_samples; */
 
-	/* c->miss->pmu->start(c->miss, PERF_EF_RELOAD); */
-	/* c->write->pmu->start(c->write, PERF_EF_RELOAD); */
-	
+	spin_unlock_irqrestore(&(c->samples_lock), flags);
+}
+
+static void add_event(void *arg)
+{
+	struct core *c = this_cpu_ptr(core);
+	struct sample *s = (struct sample *) arg;
+	unsigned long flags;
+
+	spin_lock_irqsave(&(c->samples_lock), flags);
+
 	getnstimeofday(&(c->samples[c->cur_id].timestamp));
-	c->samples[c->cur_id].miss = c->cur_id;
-	c->samples[c->cur_id].write = c->cur_id + 1;
+	c->samples[c->cur_id].miss  = 0;
+	c->samples[c->cur_id].write = 0;
+	c->samples[c->cur_id].event = s->event;
+	c->samples[c->cur_id].event_value = s->event_value;
 	c->cur_id = (c->cur_id + 1) % nr_samples;
+
+	spin_unlock_irqrestore(&(c->samples_lock), flags);
 }
 
 static enum hrtimer_restart timer_handler(struct hrtimer *timer)
@@ -778,7 +953,7 @@ int init_module(void)
 		c->cur_id     = 0;
 		c->read_id    = 0;
 		c->proc_entry = NULL;
-		c->state      = RUNNING;
+		c->state      = UNKNOWN;
 	}
 	for_each_online_cpu(cpu) {
 		c = per_cpu_ptr(core, cpu);
@@ -790,17 +965,22 @@ int init_module(void)
 			err = -ENOMEM;
 			goto err;
 		}
+
+		/* Initialize spinlock */
+		spin_lock_init(&(c->samples_lock));
 		
 		/* Initialize counters */
-		/* if (init_counters(c) != 0) { */
-		/* 	err = -EPERM; */
-		/* 	goto err; */
-		/* } */
+		if (init_counters(c) != 0) {
+			err = -EPERM;
+			goto err;
+		}
 
 		/* Initialize timers */
 		if (smp_call_function_single(cpu, init_hrtimer, NULL, 1) != 0) {
 			pr_warn("timer initialization failed on CPU%d\n", cpu);
 		}
+
+		c->state = RUNNING;
 	}
 	put_online_cpus();
 
@@ -811,13 +991,15 @@ int init_module(void)
 err:
 	for_each_online_cpu(cpu) {
 		c = per_cpu_ptr(core, cpu);
-		kfree(c->samples);
-		/* if (c->miss != NULL) */
-		/* 	perf_event_release_kernel(c->miss); */
-		/* if (c->write != NULL) */
-		/* 	perf_event_release_kernel(c->write); */
-		if (smp_call_function_single(cpu, cancel_hrtimer, NULL, 1) != 0) {
-			pr_warn("timer cancellation failed on CPU%d\n", cpu);
+		if (c->state != UNKNOWN) {
+			if (c->miss != NULL)
+				perf_event_release_kernel(c->miss);
+			if (c->write != NULL)
+				perf_event_release_kernel(c->write);
+			if (smp_call_function_single(cpu, cancel_hrtimer, NULL, 1) != 0) {
+				pr_warn("timer cancellation failed on CPU%d\n", cpu);
+			}
+			kfree(c->samples);
 		}
 	}
 	put_online_cpus();
@@ -835,15 +1017,15 @@ void cleanup_module(void)
 	struct core *c;
 
 	cancel_timers();
-	/* disable_counters(); */
+	disable_counters();
 
 	get_online_cpus();
 	for_each_online_cpu(cpu) {
 		c = per_cpu_ptr(core, cpu);
-		/* if (c != NULL) { */
-		/* 	perf_event_release_kernel(c->miss); */
-		/* 	perf_event_release_kernel(c->write); */
-		/* } */
+		if (c != NULL) {
+			perf_event_release_kernel(c->miss);
+			perf_event_release_kernel(c->write);
+		}
 		kfree(c->samples);
 	}
 	put_online_cpus();
