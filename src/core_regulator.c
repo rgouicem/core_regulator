@@ -4,16 +4,20 @@
 #include <linux/moduleparam.h>
 #include <linux/cpu.h>
 #include <linux/percpu.h>
-#include <linux/perf_event.h>
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
-#include <linux/timekeeping.h>
 #include <linux/slab.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/cdev.h>
 #include <asm-generic/delay.h>
 #include <linux/spinlock.h>
+
+#ifndef NO_PMU
+#include <linux/perf_event.h>
+#else
+#include <asm-generic/uaccess.h>
+#endif
 
 #include "ioctl.h"
 
@@ -23,8 +27,8 @@ MODULE_LICENSE("GPL");
 
 #define PROCFS_DIRNAME "core_regulator"
 #define STOP_DURATION_US 1000000
-#define DEFAULT_PERIOD_US 100
-#define DEFAULT_NR_SAMPLES 100000
+#define DEFAULT_PERIOD_US 1000
+#define DEFAULT_NR_SAMPLES 20000
 #define EVENT_STR_LEN 10
 
 
@@ -46,12 +50,16 @@ struct sample {
 
 struct core {
 	unsigned int id;                    /* core ID */
-	struct perf_event *miss;            /* pmc: L1 misses */
-	struct perf_event *write;           /* pmc: L1 write requests */
+#ifndef NO_PMU
+	struct perf_event *miss;            /* pmc: LLC load misses */
+	struct perf_event *write;           /* pmc: LLC write misses */
+#endif
 	struct hrtimer timer;               /* hrtimer */
 	void (*function)(void);             /* timer callback function */
 	ktime_t period;                     /* timer period */
 	unsigned int slow_rate;             /* slowdown rate (0-100) */
+	/* struct hrtimer slowdown_timer;      /\* timer used for HLT slowdown *\/ */
+	/* volatile bool stop_hlt;             /\* stop HLT loop for slowdown *\/ */
 	struct sample *samples;             /* samples */
 	unsigned int cur_id;                /* current sample ID (write) */
 	unsigned int read_id;               /* current sample ID (read) */
@@ -175,7 +183,7 @@ MODULE_PARM_DESC(nr_samples, "Maximum number of samples stored in memory \
 static int proc_open(struct inode *inode, struct file *file)
 {
 	int ret;
-	u64 id;
+	unsigned long id;
 	struct seq_file *sf;
 
 	ret = seq_open(file, &seqops);
@@ -188,13 +196,13 @@ static int proc_open(struct inode *inode, struct file *file)
 
 static void *proc_start(struct seq_file *m, loff_t *pos)
 {
-	u64 id;
+	unsigned long id;
 	struct core *c;
 
 	if (*pos == 0)
 		return SEQ_START_TOKEN;
 
-	id = (u64) m->private;
+	id = (unsigned long) m->private;
 	c = per_cpu_ptr(core, id);
 
 	if (c->cur_id == c->read_id)
@@ -209,10 +217,10 @@ static void proc_stop(struct seq_file *m, void *v)
 
 static void *proc_next(struct seq_file *m, void *v, loff_t *pos)
 {
-	u64 id;
+	unsigned long id;
 	struct core *c;
 
-	id = (u64) m->private;
+	id = (unsigned long) m->private;
 	c = per_cpu_ptr(core, id);
 
 	*pos = *pos + 1;
@@ -230,7 +238,11 @@ static int proc_show(struct seq_file *m, void *v)
 	struct sample *s;
 
 	if (unlikely(v == SEQ_START_TOKEN)) {
-		seq_printf(m, "timestamp (s) ; write ; miss ; event\n");
+#ifdef CORE2QUAD
+		seq_printf(m, "timestamp ; l2_miss ; l1_miss ; event\n");
+#else
+		seq_printf(m, "timestamp ; write ; miss ; event\n");
+#endif
 		return 0;
 	}
 
@@ -239,19 +251,20 @@ static int proc_show(struct seq_file *m, void *v)
 	    s->event == REGISTER_APP) {
 		seq_printf(m, "%ld.%09ld ; %llu ; %llu ; %s %d\n",
 			   s->timestamp.tv_sec, s->timestamp.tv_nsec,
-			   s->write, s->miss, event_to_str(s->event),
-			   s->event_value);
+			   s->write, s->miss,
+			   event_to_str(s->event), s->event_value);
 	} else {
 		seq_printf(m, "%ld.%09ld ; %llu ; %llu ; %s\n",
 			   s->timestamp.tv_sec, s->timestamp.tv_nsec,
-			   s->write, s->miss, event_to_str(s->event));
+			   s->write, s->miss,
+			   event_to_str(s->event));
 	}
 
 	return 0;
 }
 
 static ssize_t read_info_proc(struct file *file, char __user *buffer,
-				 size_t count, loff_t *offset)
+			      size_t count, loff_t *offset)
 {
 	int cpu, len = 0;
 	struct core *c;
@@ -304,7 +317,7 @@ static ssize_t write_ctrl_proc(struct file *file, const char __user *buffer,
 		goto err;
 	}
 
-	pr_warn("ioctl command: '%s'\n", kbuf);
+	pr_debug("ioctl command: '%s'\n", kbuf);
 	
 	if (strncmp(kbuf, "profile ", strlen("profile ")) == 0) {
 		err = cpumask_parse(kbuf + strlen("profile "), &mask);
@@ -380,10 +393,10 @@ static ssize_t write_ctrl_proc(struct file *file, const char __user *buffer,
 		if (strncmp(kbuf + strlen("slow "), "prof ", strlen("prof ")) == 0)
 			prof = true;
 		if (prof) {
-			pr_info("slow prof\n");
+			pr_debug("slow prof\n");
 			ret = sscanf(kbuf, "slow prof %u", &slow_rate);
 		} else {
-			pr_info("slow\n");
+			pr_debug("slow\n");
 			ret = sscanf(kbuf, "slow %u", &slow_rate);
 		}
 		if (ret != 1) {
@@ -541,7 +554,7 @@ static long ioctl_funcs(struct file *filp, unsigned int cmd, unsigned long arg)
 			return -1;
 		}
 		//rt_proc.pid = data->pid;
-		pr_info("ioctl pid supplied: %d\n", rt_proc.pid);
+		pr_debug("ioctl pid supplied: %d\n", rt_proc.pid);
 		rt_proc.nr_runs = 0;
 		rt_proc.best_exec_time = ns_to_timespec(0);
 		rt_proc.last_start = ns_to_timespec(0);
@@ -619,7 +632,6 @@ static long ioctl_funcs(struct file *filp, unsigned int cmd, unsigned long arg)
 static int setup_ioctl(void)
 {
 	int ret;
-	/* dev_t dev_no, dev; */
 	unsigned int major = 225;
 
 	fops_ioctl.owner = THIS_MODULE;
@@ -627,18 +639,7 @@ static int setup_ioctl(void)
 	fops_ioctl.release = release_ioctl;
 	fops_ioctl.unlocked_ioctl = ioctl_funcs;
 
-	/* device = cdev_alloc(); */
-	/* if (device == NULL) { */
-	/* 	pr_warn("device allocation failed\n"); */
-	/* 	ret = -1; */
-	/* 	goto err; */
-	/* } */
-	/* device->owner = THIS_MODULE; */
-	/* device->ops = &fops_ioctl; */
-	/* dev_no = MKDEV(227, 0); */
-	/* ret = register_chrdev_region(dev_no, 1, IOCTL_DEVNAME); */
 	ret = __register_chrdev(major, 0, 1, IOCTL_DEVNAME, &fops_ioctl);
-	//ret = alloc_chrdev_region(&dev_no, 0, 1, IOCTL_DEVNAME);
 	if (ret < 0) {
 		pr_err("device allocation failed\n");
 		return ret;
@@ -646,19 +647,9 @@ static int setup_ioctl(void)
 
 	dev_major = (major == 0) ? ret : major;
 
-	/* dev_major = MAJOR(dev_no); */
-	/* dev = MKDEV(dev_major, 0); */
 	pr_info("device major number = %d", dev_major);
-	/* ret = cdev_add(device, dev, 1); */
-	/* if (ret < 0) { */
-	/* 	pr_warn("device allocation failed\n"); */
-	/* 	goto err; */
-	/* } */
-
+	
 	return 0;
-
-/* err: */
-/* 	return ret; */
 }
 
 static void cleanup_ioctl(void)
@@ -668,6 +659,7 @@ static void cleanup_ioctl(void)
 	__unregister_chrdev(dev_major, 0, 1, IOCTL_DEVNAME);
 }
 
+#ifndef NO_PMU
 static struct perf_event *init_counter(int cpu, int event_type, int event_id)
 {
 	long err;
@@ -711,19 +703,28 @@ static int init_counters(struct core *c)
 	int config;
 	long err = 0;
 
-	config   = PERF_COUNT_HW_CACHE_L1D;
+#ifdef CORE2QUAD
+	c->miss  = init_counter(c->id, PERF_TYPE_RAW, 0x712E);
+#else
+	/* config   = PERF_COUNT_HW_CACHE_L1D; */
+	config   = PERF_COUNT_HW_CACHE_LL;
 	config  |= (PERF_COUNT_HW_CACHE_OP_READ << 8);
 	config  |= (PERF_COUNT_HW_CACHE_RESULT_MISS << 16);
 	c->miss  = init_counter(c->id, PERF_TYPE_HW_CACHE, config);
+#endif
 	if (c->miss == NULL) {
 		err = -1;
 		goto err;
 	}
-
-	config   = PERF_COUNT_HW_CACHE_L1D;
+#ifdef CORE2QUAD
+	c->write = init_counter(c->id, PERF_TYPE_RAW, 0x0F45);
+#else
+	/* config   = PERF_COUNT_HW_CACHE_L1D; */
+	config   = PERF_COUNT_HW_CACHE_LL;
 	config  |= (PERF_COUNT_HW_CACHE_OP_WRITE << 8);
-	config  |= (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16);
+	config  |= (PERF_COUNT_HW_CACHE_RESULT_MISS << 16);
 	c->write = init_counter(c->id, PERF_TYPE_HW_CACHE, config);
+#endif
 	if (c->write == NULL) {
 		err = -1;
 		goto clean;
@@ -759,6 +760,7 @@ static void disable_counters(void)
 	}
 	put_online_cpus();
 }
+#endif
 
 static void slowdown_prof(void)
 {
@@ -781,17 +783,44 @@ static void slowdown_prof(void)
 	/* add_event(&s); */
 }
 
+/* static enum hrtimer_restart stop_hlt(struct hrtimer *timer) */
+/* { */
+/* 	struct core *c = this_cpu_ptr(core); */
+
+/* 	pr_info("stop HLT on CPU%d\n", c->id); */
+/* 	c->stop_hlt = true; */
+
+/* 	return HRTIMER_NORESTART; */
+/* } */
+
 static void slowdown(void)
 {
 	struct core *c = this_cpu_ptr(core);
 	/* struct sample s; */
-	/* struct timespec a, b, d; */
+	/* struct timespec start, t, diff; */
+	
 	u64 delay;
+	/* u64 count = 0; */
+	/* ktime_t kt; */
+	/* int cpuidle_state; */
 
-	/* getnstimeofday(&a); */
+	/* getnstimeofday(&start); */
 	c->state = SLOWING_DOWN;
 	delay = ((ktime_to_ns(c->period) / 1000) * c->slow_rate) / 100;
+	/* delay = (ktime_to_ns(c->period) * c->slow_rate) / 100; */
+	/* kt = ns_to_ktime(delay); */
+	pr_debug("slowdown delay = %llu ns\n", delay);
+	/* c->stop_hlt = false; */
+	/* hrtimer_start(&(c->slowdown_timer), kt, HRTIMER_MODE_REL_PINNED); */
+	/* do { */
+	/* 	/\* pr_info("HLT on CPU%d\n", c->id); *\/ */
+	/* 	asm volatile ("hlt\n" */
+	/* 		      :::); */
+	/* 	count++; */
+	/* } while (!c->stop_hlt); */
+	/* pr_info("HLT called %llu times on CPU%d\n", count, c->id); */
 	udelay(delay);
+	
 	/* getnstimeofday(&b); */
 	/* d = timespec_sub(b, a); */
 	/* s.miss  = 0; */
@@ -799,6 +828,21 @@ static void slowdown(void)
 	/* s.event = SLOW_INT; */
 	/* s.event_value = timespec_to_ns(&d); */
 	/* add_event(&s); */
+
+	/************************** cpuidle solution **************/
+	/* rcu_idle_enter(); */
+	/* if (cpuidle_not_available(c->cpuidle_drv, c->cpuidle_dev)) { */
+	/* 	default_idle_call(); */
+	/* 	goto exit_idle; */
+	/* } */
+	/* cpuidle_state = cpuidle_enter(c->cpuidle_drv, c->cpuidle_dev, 0); */
+	/* cpuidle_reflect(c->cpuidle_dev, cpuidle_state); */
+
+/* exit_idle: */
+/* 	if (WARN_ON_ONCE(irqs_disabled())) */
+/* 		local_irq_enable(); */
+
+/* 	rcu_idle_exit(); */
 }
 
 static void stop(void)
@@ -821,25 +865,32 @@ static void profile(void)
 
 	spin_lock_irqsave(&(c->samples_lock), flags);
 	c->state = PROFILING;
+
+#ifndef NO_PMU
 	c->miss->pmu->stop(c->miss, PERF_EF_UPDATE);
 	c->write->pmu->stop(c->write, PERF_EF_UPDATE);
+#endif
 
 	getnstimeofday(&(c->samples[c->cur_id].timestamp));
+
+#ifndef NO_PMU
 	c->samples[c->cur_id].miss  = local64_read(&(c->miss)->count);
 	c->samples[c->cur_id].write = local64_read(&(c->write)->count);
+#else
+	c->samples[c->cur_id].miss = c->cur_id;
+	c->samples[c->cur_id].write = c->cur_id + 1;
+#endif
+
 	c->samples[c->cur_id].event = NONE;
 	c->cur_id = (c->cur_id + 1) % nr_samples;
 
+#ifndef NO_PMU
 	local64_set(&(c->miss)->count, 0);
 	local64_set(&(c->write)->count, 0);
 
 	c->miss->pmu->start(c->miss, PERF_EF_RELOAD);
 	c->write->pmu->start(c->write, PERF_EF_RELOAD);
-	
-	/* getnstimeofday(&(c->samples[c->cur_id].timestamp)); */
-	/* c->samples[c->cur_id].miss = c->cur_id; */
-	/* c->samples[c->cur_id].write = c->cur_id + 1; */
-	/* c->cur_id = (c->cur_id + 1) % nr_samples; */
+#endif
 
 	spin_unlock_irqrestore(&(c->samples_lock), flags);
 }
@@ -853,9 +904,9 @@ static void add_event(void *arg)
 	spin_lock_irqsave(&(c->samples_lock), flags);
 
 	getnstimeofday(&(c->samples[c->cur_id].timestamp));
-	c->samples[c->cur_id].miss  = 0;
-	c->samples[c->cur_id].write = 0;
-	c->samples[c->cur_id].event = s->event;
+	c->samples[c->cur_id].miss        = 0;
+	c->samples[c->cur_id].write       = 0;
+	c->samples[c->cur_id].event       = s->event;
 	c->samples[c->cur_id].event_value = s->event_value;
 	c->cur_id = (c->cur_id + 1) % nr_samples;
 
@@ -867,9 +918,9 @@ static enum hrtimer_restart timer_handler(struct hrtimer *timer)
 	struct core *c = this_cpu_ptr(core);
 
 	if (c->function != NULL) {
-		c->function();
-	
 		hrtimer_forward_now(timer, c->period);
+
+		c->function();
 
 		return HRTIMER_RESTART;
 	}
@@ -889,6 +940,9 @@ static void init_hrtimer(void *arg)
 	hrtimer_init(&(c->timer), CLOCK_MONOTONIC_RAW,
 		     HRTIMER_MODE_REL_PINNED);
 	c->timer.function = timer_handler;
+	/* hrtimer_init(&(c->slowdown_timer), CLOCK_MONOTONIC_RAW, */
+	/* 	     HRTIMER_MODE_REL_PINNED); */
+	/* c->slowdown_timer.function = stop_hlt; */
 }
 
 static void cancel_hrtimer(void *arg)
@@ -896,6 +950,7 @@ static void cancel_hrtimer(void *arg)
 	struct core *c = this_cpu_ptr(core);
 
 	hrtimer_cancel(&(c->timer));
+	/* hrtimer_cancel(&(c->slowdown_timer)); */
 }
 
 static void cancel_timers(void)
@@ -914,6 +969,14 @@ static void cancel_timers(void)
 	}
 	put_online_cpus();
 }
+
+/* static void init_cpuidle(void *arg) */
+/* { */
+/* 	struct core *c = this_cpu_ptr(core); */
+
+/* 	c->cpuidle_dev = __this_cpu_read(cpuidle_devices); */
+/* 	c->cpuidle_drv = cpuidle_get_cpu_driver(c->cpuidle_dev); */
+/* } */
 
 int init_module(void)
 {
@@ -935,25 +998,37 @@ int init_module(void)
 	core = alloc_percpu(struct core);
 
 	/* procfs setup */
-	setup_procfs();
+	err = setup_procfs();
+	if (err < 0) {
+		pr_err("procfs setup failed: errno = %ld\n", err);
+		goto clean_alloc;
+	} else
+		pr_debug("procfs setup complete\n");
 
 	/* ioctl setup */
-	setup_ioctl();
+	err = setup_ioctl();
+	if (err < 0) {
+		pr_err("ioctl setup failed: errno = %ld\n", err);
+		goto clean_procfs;
+	} else
+		pr_debug("ioctl setup complete\n");
 
 	/* On each CPU, initialize counters and timers */
 	get_online_cpus();
 	for_each_online_cpu(cpu) {
-		c             = per_cpu_ptr(core, cpu);
-		c->id         = cpu;
-		c->function   = NULL;
-		c->period     = kt_period;
-		c->slow_rate  = 50;
-		c->miss       = NULL;
-		c->write      = NULL;
-		c->cur_id     = 0;
-		c->read_id    = 0;
-		c->proc_entry = NULL;
-		c->state      = UNKNOWN;
+		c              = per_cpu_ptr(core, cpu);
+		c->id          = cpu;
+		c->function    = NULL;
+		c->period      = kt_period;
+		c->slow_rate   = 50;
+#ifndef NO_PMU
+		c->miss        = NULL;
+		c->write       = NULL;
+#endif
+		c->cur_id      = 0;
+		c->read_id     = 0;
+		c->proc_entry  = NULL;
+		c->state       = UNKNOWN;
 	}
 	for_each_online_cpu(cpu) {
 		c = per_cpu_ptr(core, cpu);
@@ -968,17 +1043,24 @@ int init_module(void)
 
 		/* Initialize spinlock */
 		spin_lock_init(&(c->samples_lock));
-		
+
+#ifndef NO_PMU
 		/* Initialize counters */
 		if (init_counters(c) != 0) {
 			err = -EPERM;
 			goto err;
 		}
+#endif
 
 		/* Initialize timers */
 		if (smp_call_function_single(cpu, init_hrtimer, NULL, 1) != 0) {
 			pr_warn("timer initialization failed on CPU%d\n", cpu);
 		}
+
+		/* /\* Initialize cpuidle driver *\/ */
+		/* if (smp_call_function_single(cpu, init_cpuidle, NULL, 1) != 0) { */
+		/* 	pr_warn("cpuidle initialization failed on CPU%d\n", cpu); */
+		/* } */
 
 		c->state = RUNNING;
 	}
@@ -992,10 +1074,12 @@ err:
 	for_each_online_cpu(cpu) {
 		c = per_cpu_ptr(core, cpu);
 		if (c->state != UNKNOWN) {
+#ifndef NO_PMU
 			if (c->miss != NULL)
 				perf_event_release_kernel(c->miss);
 			if (c->write != NULL)
 				perf_event_release_kernel(c->write);
+#endif
 			if (smp_call_function_single(cpu, cancel_hrtimer, NULL, 1) != 0) {
 				pr_warn("timer cancellation failed on CPU%d\n", cpu);
 			}
@@ -1004,6 +1088,10 @@ err:
 	}
 	put_online_cpus();
 
+	cleanup_ioctl();
+clean_procfs:
+	cleanup_procfs();
+clean_alloc:
 	free_percpu(core);
 
 	pr_err("module insertion failed!\n");
@@ -1017,16 +1105,20 @@ void cleanup_module(void)
 	struct core *c;
 
 	cancel_timers();
+#ifndef NO_PMU
 	disable_counters();
+#endif
 
 	get_online_cpus();
 	for_each_online_cpu(cpu) {
 		c = per_cpu_ptr(core, cpu);
 		if (c != NULL) {
+#ifndef NO_PMU
 			perf_event_release_kernel(c->miss);
 			perf_event_release_kernel(c->write);
+#endif
+			kfree(c->samples);
 		}
-		kfree(c->samples);
 	}
 	put_online_cpus();
 
