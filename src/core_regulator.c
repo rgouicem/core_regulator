@@ -103,17 +103,17 @@ static ktime_t kt_period;                            /* period in a ktime_t */
 static unsigned int nr_samples = DEFAULT_NR_SAMPLES; /* max number of stored samples */
 static struct proc_dir_entry *proc_dir;              /* procfs directory */
 static struct file_operations fops_seq = {           /* procfs data structures */
-    .owner   = THIS_MODULE,
-    .open    = proc_open,
-    .read    = seq_read,
-    .llseek  = seq_lseek,
-    .release = seq_release
+	.owner   = THIS_MODULE,
+	.open    = proc_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = seq_release
 };
 static struct seq_operations seqops = {
-    .start = proc_start,
-    .next  = proc_next,
-    .stop  = proc_stop,
-    .show  = proc_show
+	.start = proc_start,
+	.next  = proc_next,
+	.stop  = proc_stop,
+	.show  = proc_show
 };
 static char *info_buffer;
 static struct file_operations fops_info;
@@ -765,22 +765,13 @@ static void disable_counters(void)
 static void slowdown_prof(void)
 {
 	struct core *c = this_cpu_ptr(core);
-	/* struct sample s; */
-	/* struct timespec a, b, d; */
 	u64 delay;
 
-	/* getnstimeofday(&a); */
 	profile();
 	c->state = SLOWING_DOWN;
 	delay = ((ktime_to_ns(c->period) / 1000) * c->slow_rate) / 100;
+	pr_debug("slowdown delay = %llu ns\n", delay);
 	udelay(delay);
-	/* getnstimeofday(&b); */
-	/* d = timespec_sub(b, a); */
-	/* s.miss  = 0; */
-	/* s.write = 0; */
-	/* s.event = SLOW_INT; */
-	/* s.event_value = timespec_to_ns(&d); */
-	/* add_event(&s); */
 }
 
 /* static enum hrtimer_restart stop_hlt(struct hrtimer *timer) */
@@ -796,53 +787,12 @@ static void slowdown_prof(void)
 static void slowdown(void)
 {
 	struct core *c = this_cpu_ptr(core);
-	/* struct sample s; */
-	/* struct timespec start, t, diff; */
-	
 	u64 delay;
-	/* u64 count = 0; */
-	/* ktime_t kt; */
-	/* int cpuidle_state; */
 
-	/* getnstimeofday(&start); */
 	c->state = SLOWING_DOWN;
 	delay = ((ktime_to_ns(c->period) / 1000) * c->slow_rate) / 100;
-	/* delay = (ktime_to_ns(c->period) * c->slow_rate) / 100; */
-	/* kt = ns_to_ktime(delay); */
 	pr_debug("slowdown delay = %llu ns\n", delay);
-	/* c->stop_hlt = false; */
-	/* hrtimer_start(&(c->slowdown_timer), kt, HRTIMER_MODE_REL_PINNED); */
-	/* do { */
-	/* 	/\* pr_info("HLT on CPU%d\n", c->id); *\/ */
-	/* 	asm volatile ("hlt\n" */
-	/* 		      :::); */
-	/* 	count++; */
-	/* } while (!c->stop_hlt); */
-	/* pr_info("HLT called %llu times on CPU%d\n", count, c->id); */
 	udelay(delay);
-	
-	/* getnstimeofday(&b); */
-	/* d = timespec_sub(b, a); */
-	/* s.miss  = 0; */
-	/* s.write = 0; */
-	/* s.event = SLOW_INT; */
-	/* s.event_value = timespec_to_ns(&d); */
-	/* add_event(&s); */
-
-	/************************** cpuidle solution **************/
-	/* rcu_idle_enter(); */
-	/* if (cpuidle_not_available(c->cpuidle_drv, c->cpuidle_dev)) { */
-	/* 	default_idle_call(); */
-	/* 	goto exit_idle; */
-	/* } */
-	/* cpuidle_state = cpuidle_enter(c->cpuidle_drv, c->cpuidle_dev, 0); */
-	/* cpuidle_reflect(c->cpuidle_dev, cpuidle_state); */
-
-/* exit_idle: */
-/* 	if (WARN_ON_ONCE(irqs_disabled())) */
-/* 		local_irq_enable(); */
-
-/* 	rcu_idle_exit(); */
 }
 
 static void stop(void)
