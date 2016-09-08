@@ -224,8 +224,11 @@ static void *proc_next(struct seq_file *m, void *v, loff_t *pos)
 	c = per_cpu_ptr(core, id);
 
 	*pos = *pos + 1;
-	if (likely(*pos != 1))
-		c->read_id = (c->read_id + 1) % nr_samples;
+	if (likely(*pos != 1)) {
+		c->read_id++;
+		if (c->read_id >= nr_samples)
+			c->read_id = 0;
+	}
 
 	if (unlikely(c->read_id == c->cur_id))
 		return NULL;
@@ -832,7 +835,9 @@ static void profile(void)
 #endif
 
 	c->samples[c->cur_id].event = NONE;
-	c->cur_id = (c->cur_id + 1) % nr_samples;
+	c->cur_id++;
+	if (c->cur_id >= nr_samples)
+		c->cur_id = 0;
 
 #ifndef NO_PMU
 	local64_set(&(c->miss)->count, 0);
@@ -858,7 +863,10 @@ static void add_event(void *arg)
 	c->samples[c->cur_id].write       = 0;
 	c->samples[c->cur_id].event       = s->event;
 	c->samples[c->cur_id].event_value = s->event_value;
-	c->cur_id = (c->cur_id + 1) % nr_samples;
+	/* c->cur_id = (c->cur_id + 1) % nr_samples; */
+	c->cur_id++;
+	if (c->cur_id >= nr_samples)
+		c->cur_id = 0;
 
 	spin_unlock_irqrestore(&(c->samples_lock), flags);
 }
