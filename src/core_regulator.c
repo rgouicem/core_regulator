@@ -304,7 +304,8 @@ static ssize_t write_ctrl_proc(struct file *file, const char __user *buffer,
 			       size_t count, loff_t *offset)
 {
 	int ret, cpu, err;
-	char *kbuf;
+	char *kbuf, *cpumask_buf;
+	int cpumask_len = 10;
 	struct core *c;
 	cpumask_t mask;
 	unsigned int slow_rate, str_padding;
@@ -312,7 +313,8 @@ static ssize_t write_ctrl_proc(struct file *file, const char __user *buffer,
 	bool prof;
 	
 	kbuf = kzalloc(count, GFP_KERNEL);
-	if (kbuf == NULL)
+	cpumask_buf = kzalloc(10, GFP_KERNEL);
+	if (kbuf == NULL || cpumask_buf == NULL)
 		return -EFAULT;
 
 	ret = simple_write_to_buffer(kbuf, count, offset, buffer, count);
@@ -323,7 +325,7 @@ static ssize_t write_ctrl_proc(struct file *file, const char __user *buffer,
 	pr_debug("ioctl command: '%s'\n", kbuf);
 	
 	if (strncmp(kbuf, "profile ", strlen("profile ")) == 0) {
-		err = cpumask_parse(kbuf + strlen("profile "), &mask);
+		err = cpumask_parse_user(buffer + strlen("profile "), cpumask_len, &mask);
 		if (IS_ERR_VALUE(err)) {
 			ret = err;
 			pr_debug("cpumask_parse failed: '%s'\n",
@@ -347,7 +349,7 @@ static ssize_t write_ctrl_proc(struct file *file, const char __user *buffer,
 		}
 		put_online_cpus();
 	} else if (strncmp(kbuf, "run ", strlen("run ")) == 0) {
-		err = cpumask_parse(kbuf + strlen("run "), &mask);
+		err = cpumask_parse_user(buffer + strlen("run "), cpumask_len, &mask);
 		if (IS_ERR_VALUE(err)) {
 			ret = err;
 			pr_debug("cpumask_parse failed\n");
@@ -370,7 +372,7 @@ static ssize_t write_ctrl_proc(struct file *file, const char __user *buffer,
 		}
 		put_online_cpus();
 	} else if (strncmp(kbuf, "stop ", strlen("stop ")) == 0) {
-		err = cpumask_parse(kbuf + strlen("stop "), &mask);
+		err = cpumask_parse_user(buffer + strlen("stop "), cpumask_len, &mask);
 		if (IS_ERR_VALUE(err)) {
 			ret = err;
 			pr_debug("cpumask_parse failed: '%s'\n", kbuf + strlen("stop "));
@@ -415,9 +417,11 @@ static ssize_t write_ctrl_proc(struct file *file, const char __user *buffer,
 		str_padding = slow_rate < 10 ? 1 :	\
 			slow_rate < 100 ? 2 : 3;
 		if (prof)
-			err = cpumask_parse(kbuf + strlen("slow prof  ") + str_padding, &mask);
+			err = cpumask_parse_user(buffer + strlen("slow prof  ") + str_padding,
+						 cpumask_len, &mask);
 		else
-			err = cpumask_parse(kbuf + strlen("slow  ") + str_padding, &mask);
+			err = cpumask_parse_user(buffer + strlen("slow  ") + str_padding,
+						 cpumask_len, &mask);
 		if (IS_ERR_VALUE(err)) {
 			ret = err;
 			pr_debug("cpumask_parse failed: '%s'\n",
@@ -458,6 +462,7 @@ static ssize_t write_ctrl_proc(struct file *file, const char __user *buffer,
 
 err:
 	kfree(kbuf);
+	kfree(cpumask_buf);
 	
 	return ret;
 }
