@@ -494,10 +494,10 @@ static int setup_procfs(void)
 	put_online_cpus();
 
 	/* setup info procfile */
-	info_buffer = kzalloc(PAGE_SIZE, GFP_KERNEL);
+	info_buffer = (char *)get_zeroed_page(GFP_KERNEL);
 	if (info_buffer == NULL) {
-		goto info_alloc_err;
 		pr_warn("%s/info file creation failed\n", PROCFS_DIRNAME);
+		goto info_alloc_err;
 	}
 	fops_info.owner = THIS_MODULE;
 	fops_info.read  = read_info_proc;
@@ -519,7 +519,7 @@ static int setup_procfs(void)
 	return 0;
 
 info_create_err:
-	kfree(info_buffer);
+	free_page((unsigned long)info_buffer);
 info_alloc_err:
 ctrl_create_err:
 err:
@@ -529,7 +529,8 @@ err:
 static void cleanup_procfs(void)
 {
 	proc_remove(proc_dir);
-	kfree(info_buffer);
+	/* remove_proc_entry(PROCFS_DIRNAME, proc_dir); */
+	free_page((unsigned long)info_buffer);
 }
 
 static int open_ioctl(struct inode *inode, struct file *filp)
