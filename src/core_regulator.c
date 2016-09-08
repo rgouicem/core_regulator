@@ -11,6 +11,7 @@
 #include <linux/seq_file.h>
 #include <linux/cdev.h>
 #include <asm-generic/delay.h>
+//#include <asm-generic/uaccess.h>
 #include <linux/spinlock.h>
 
 #ifndef NO_PMU
@@ -29,7 +30,8 @@ MODULE_LICENSE("GPL");
 #define STOP_DURATION_US 1000000
 #define DEFAULT_PERIOD_US 1000
 #define DEFAULT_NR_SAMPLES 20000
-#define EVENT_STR_LEN 10
+#define DEFAULT_ADAPTIVE_THRESHOLD 50
+#define DEFAULT_ADAPTIVE_STEP 5
 
 
 /****************************************
@@ -72,8 +74,10 @@ struct process {
 	pid_t pid;                          /* process id */
 	struct core *core;                  /* core where process runs */
 	u64 nr_runs;                        /* number of times process ran */
-	struct timespec best_exec_time;     /* best execution time so far */
+	/* struct timespec best_exec_time;     /\* best execution time so far *\/ */
 	struct timespec last_start;         /* last starting date */
+	struct timespec deadline;           /* relative deadline for one run */
+	bool slow_enabled;                  /* true if mecanism has started */
 };
 
 
@@ -122,6 +126,8 @@ static struct file_operations fops_ctrl;
 static int dev_major;                      /* device major number */
 static struct file_operations fops_ioctl;  /* fops for ioctl */
 static struct process rt_proc;             /* process that has high priority */
+static unsigned int adaptive_threshold = DEFAULT_ADAPTIVE_THRESHOLD;
+static unsigned int adaptive_step = DEFAULT_ADAPTIVE_STEP;
 
 
 /****************************************
@@ -133,6 +139,12 @@ MODULE_PARM_DESC(period, "Sampling period in usec \
 module_param(nr_samples, uint, 0444);
 MODULE_PARM_DESC(nr_samples, "Maximum number of samples stored in memory \
 (default: 100000)");
+module_param(adaptive_threshold, uint, 0444);
+MODULE_PARM_DESC(adaptive_threshold, "Slowdown applied the first time overhead \
+is detected (default: 50)");
+module_param(adaptive_step, uint, 0444);
+MODULE_PARM_DESC(adaptive_step, "Step used when changing slowdown \
+(default: 5)");
 
 
 /****************************************
@@ -545,27 +557,118 @@ static int release_ioctl(struct inode *inode, struct file *filp)
 	return 0;
 }
 
+static void adapt_slowdown(struct timespec *exec)
+{
+	int cpu;
+	struct sample s;
+	struct core *c;
+
+	pr_info("execTime=%lu.%09lu ; deadline=%lu.%09lu\n",
+		exec->tv_sec, exec->tv_nsec,
+		rt_proc.deadline.tv_sec, rt_proc.deadline.tv_nsec);
+	/* if we exceedded the deadline */
+	if (timespec_compare(exec, &(rt_proc.deadline)) > 0) {
+		/* if we were already adapting the slowdown,
+		 * then increase the slowdown,
+		 * else start slowndown at default slow rate
+		 */
+		if (rt_proc.slow_enabled) {
+			pr_info("overhead + enabled\n");
+			get_online_cpus();
+			for_each_online_cpu(cpu) {
+				if (cpu != rt_proc.core->id) {
+					c = per_cpu_ptr(core, cpu);
+					c->slow_rate += adaptive_step;
+					if (c->slow_rate > 95)
+						c->slow_rate = 95;
+					s.event = SLOW;
+					s.event_value = c->slow_rate;
+					smp_call_function_single(cpu, add_event,
+								 &s, 1);
+				}
+			}
+			put_online_cpus();
+		} else {
+			pr_info("overhead + disabled\n");
+			rt_proc.slow_enabled = true;
+			get_online_cpus();
+			for_each_online_cpu(cpu) {
+				if (cpu != rt_proc.core->id) {
+					c = per_cpu_ptr(core, cpu);
+					c->slow_rate = adaptive_threshold;
+					c->period = kt_period;
+					c->function = slowdown;
+					s.event = SLOW;
+					s.event_value = c->slow_rate;
+					smp_call_function_single(cpu, add_event,
+								 &s, 1);
+					if (!hrtimer_active(&(c->timer))) {
+						pr_debug("start timer %d\n",
+							 cpu);
+						smp_call_function_single(cpu,
+									 start_hrtimer,
+									 NULL,
+									 1);
+					}
+				}
+			}
+			put_online_cpus();
+		}
+	} else {
+		/* we did not exceed the deadline */
+		/* if we were already adapting the slowdown,
+		 * then we decrease the slowdown,
+		 * else nothing
+		 */
+		if (rt_proc.slow_enabled) {
+			pr_info("no overhead + enabled\n");
+			get_online_cpus();
+			for_each_online_cpu(cpu) {
+				if (cpu != rt_proc.core->id) {
+					c = per_cpu_ptr(core, cpu);
+					c->slow_rate -= adaptive_step;
+					if (c->slow_rate < 0)
+						c->slow_rate = 0;
+					s.event = SLOW;
+					s.event_value = c->slow_rate;
+					smp_call_function_single(cpu, add_event,
+								 &s, 1);
+				}
+			}
+			put_online_cpus();
+		} else {
+			pr_info("no overhead + disabled\n");
+		}
+	}
+}
+
 static long ioctl_funcs(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	int ret = 0;
 	struct ioctl_data *data = (struct ioctl_data *) arg;
-	struct timespec end, exec, zero;
+	struct ioctl_data kdata;
+	struct timespec end, exec;//, zero;
 	struct pid *pid;
 	struct task_struct *task;
 	struct sample s;
+	struct core *c;
+	int cpu;
 
 	switch(cmd) {
 	case IOCTL_REGISTER:
-		ret = copy_from_user(&(rt_proc.pid), &(data->pid),
-				     sizeof(pid_t));
+		ret = copy_from_user(&kdata, data,
+				     sizeof(struct ioctl_data));
 		if (ret != 0) {
 			pr_warn("copy_from_user() failed: ret = %d\n", ret);
 			return -1;
 		}
-		//rt_proc.pid = data->pid;
+		rt_proc.pid = kdata.pid;
+		rt_proc.deadline = kdata.time;
+		rt_proc.slow_enabled = false;
 		pr_debug("ioctl pid supplied: %d\n", rt_proc.pid);
+		/* pr_debug("ioctl deadline supplied: %d\n", rt_proc.deadline); */
 		rt_proc.nr_runs = 0;
-		rt_proc.best_exec_time = ns_to_timespec(0);
+		/* rt_proc.best_exec_time = ns_to_timespec(0); */
 		rt_proc.last_start = ns_to_timespec(0);
 		pid = find_get_pid(rt_proc.pid);
 		if (pid == NULL) {
@@ -593,6 +696,24 @@ static long ioctl_funcs(struct file *filp, unsigned int cmd, unsigned long arg)
 		s.event = UNREGISTER_APP;
 		s.event_value = rt_proc.pid;
 		smp_call_function_single(smp_processor_id(), add_event, &s, 1);
+		get_online_cpus();
+		for_each_online_cpu(cpu) {
+			if (cpu != rt_proc.core->id) {
+				c = per_cpu_ptr(core, cpu);
+				if (hrtimer_active(&(c->timer))) {
+					pr_debug("cancel timer %d\n", cpu);
+					smp_call_function_single(cpu, cancel_hrtimer,
+								 NULL, 1);
+				}
+				c->function = NULL;
+				c->state = RUNNING;
+				s.miss  = 0;
+				s.write = 0;
+				s.event = RUN;
+				smp_call_function_single(cpu, add_event, &s, 1);
+			}
+		}
+		put_online_cpus();
 		rt_proc.pid = 0;
 		rt_proc.core = NULL;
 		break;
@@ -621,14 +742,18 @@ static long ioctl_funcs(struct file *filp, unsigned int cmd, unsigned long arg)
 			pr_warn("copy_to_user() failed: ret = %d\n", ret);
 			return -1;
 		}
-		zero = ns_to_timespec(0);
-		if ((timespec_compare(&(rt_proc.best_exec_time), &zero) == 0) ||
-		    (timespec_compare(&exec, &(rt_proc.best_exec_time)) < 0))
-			rt_proc.best_exec_time = exec;
+		/* zero = ns_to_timespec(0); */
+		/* if ((timespec_compare(&(rt_proc.best_exec_time), &zero) == 0) || */
+		/*     (timespec_compare(&exec, &(rt_proc.best_exec_time)) < 0)) */
+		/* 	rt_proc.best_exec_time = exec; */
 		s.miss  = 0;
 		s.write = 0;
 		s.event = STOP_APP;
 		smp_call_function_single(smp_processor_id(), add_event, &s, 1);
+		/* if a deadline was specified */
+		if (timespec_to_ns(&(rt_proc.deadline)) != 0) {
+			adapt_slowdown(&exec);
+		}
 		break;
 	default:
 		pr_warn("wrong ioctl command\n");
@@ -955,7 +1080,8 @@ int init_module(void)
 	rt_proc.pid = 0;
 	rt_proc.core = NULL;
 	rt_proc.nr_runs = 0;
-	rt_proc.best_exec_time = ns_to_timespec(0);
+	rt_proc.deadline = ns_to_timespec(0);
+	/* rt_proc.best_exec_time = ns_to_timespec(0); */
 	rt_proc.last_start = ns_to_timespec(0);
 
 	/* Alloc data for each CPU */
