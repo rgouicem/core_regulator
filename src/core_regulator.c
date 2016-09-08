@@ -709,12 +709,12 @@ static struct perf_event *init_counter(int cpu, int event_type, int event_id)
 
 static int init_counters(struct core *c)
 {
-	int config;
 	long err = 0;
 
 #ifdef CORE2QUAD
 	c->miss  = init_counter(c->id, PERF_TYPE_RAW, 0x712E);
 #else
+	int config;
 	/* config   = PERF_COUNT_HW_CACHE_L1D; */
 	config   = PERF_COUNT_HW_CACHE_LL;
 	config  |= (PERF_COUNT_HW_CACHE_OP_READ << 8);
@@ -998,8 +998,8 @@ int init_module(void)
 		c = per_cpu_ptr(core, cpu);
 
 		/* Allocate memory for samples */
-		c->samples = kmalloc_array(nr_samples, sizeof(struct sample),
-					   GFP_KERNEL);
+		c->samples = kmalloc(nr_samples * sizeof(struct sample),
+				     GFP_KERNEL);
 		if (c->samples == NULL) {
 			err = -ENOMEM;
 			goto err;
