@@ -562,6 +562,7 @@ static void adapt_slowdown(struct timespec *exec)
 	int cpu;
 	struct sample s;
 	struct core *c;
+	s64 exec_ns, deadline_ns, overhead;
 
 	pr_info("execTime=%lu.%09lu ; deadline=%lu.%09lu\n",
 		exec->tv_sec, exec->tv_nsec,
@@ -572,15 +573,23 @@ static void adapt_slowdown(struct timespec *exec)
 		 * then increase the slowdown,
 		 * else start slowndown at default slow rate
 		 */
+		deadline_ns = timespec_to_ns(&(rt_proc.deadline));
+		exec_ns     = timespec_to_ns(exec);
+		overhead = exec_ns * 100 / deadline_ns - 100;
+		pr_info("overhead = %lld * 100 / %lld - 100 = %lld %% \n",
+			exec_ns, deadline_ns, overhead);
 		if (rt_proc.slow_enabled) {
 			pr_info("overhead + enabled\n");
 			get_online_cpus();
 			for_each_online_cpu(cpu) {
 				if (cpu != rt_proc.core->id) {
 					c = per_cpu_ptr(core, cpu);
-					c->slow_rate += adaptive_step;
-					if (c->slow_rate > 95)
+					if (c->slow_rate + overhead > 95)
 						c->slow_rate = 95;
+					else if (c->slow_rate + overhead < 0)
+						c->slow_rate = 0;
+					else
+						c->slow_rate += overhead;
 					s.event = SLOW;
 					s.event_value = c->slow_rate;
 					smp_call_function_single(cpu, add_event,
@@ -595,7 +604,12 @@ static void adapt_slowdown(struct timespec *exec)
 			for_each_online_cpu(cpu) {
 				if (cpu != rt_proc.core->id) {
 					c = per_cpu_ptr(core, cpu);
-					c->slow_rate = adaptive_threshold;
+					if (overhead > 95)
+						c->slow_rate = 95;
+					else if (overhead < 0)
+						c->slow_rate = 0;
+					else
+						c->slow_rate = overhead;
 					c->period = kt_period;
 					c->function = slowdown;
 					s.event = SLOW;
@@ -620,15 +634,23 @@ static void adapt_slowdown(struct timespec *exec)
 		 * then we decrease the slowdown,
 		 * else nothing
 		 */
+		deadline_ns = timespec_to_ns(&(rt_proc.deadline));
+		exec_ns     = timespec_to_ns(exec);
+		overhead = exec_ns * 100 / deadline_ns - 100;
+		pr_info("overhead = %lld * 100 / %lld - 100 = %lld %% \n",
+			exec_ns, deadline_ns, overhead);
 		if (rt_proc.slow_enabled) {
 			pr_info("no overhead + enabled\n");
 			get_online_cpus();
 			for_each_online_cpu(cpu) {
 				if (cpu != rt_proc.core->id) {
 					c = per_cpu_ptr(core, cpu);
-					c->slow_rate -= adaptive_step;
-					if (c->slow_rate < 0)
+					if (c->slow_rate + overhead < 0)
 						c->slow_rate = 0;
+					else if (c->slow_rate + overhead > 95)
+						c->slow_rate = 95;
+					else
+						c->slow_rate += overhead;
 					s.event = SLOW;
 					s.event_value = c->slow_rate;
 					smp_call_function_single(cpu, add_event,
@@ -638,6 +660,17 @@ static void adapt_slowdown(struct timespec *exec)
 			put_online_cpus();
 		} else {
 			pr_info("no overhead + disabled\n");
+			get_online_cpus();
+			for_each_online_cpu(cpu) {
+				if (cpu != rt_proc.core->id) {
+					c = per_cpu_ptr(core, cpu);
+					s.event = SLOW;
+					s.event_value = c->slow_rate;
+					smp_call_function_single(cpu, add_event,
+								 &s, 1);
+				}
+			}
+			put_online_cpus();
 		}
 	}
 }
@@ -652,6 +685,7 @@ static long ioctl_funcs(struct file *filp, unsigned int cmd, unsigned long arg)
 	struct task_struct *task;
 	struct sample s;
 	struct core *c;
+	s64 under_deadline;
 	int cpu;
 
 	switch(cmd) {
@@ -663,7 +697,8 @@ static long ioctl_funcs(struct file *filp, unsigned int cmd, unsigned long arg)
 			return -1;
 		}
 		rt_proc.pid = kdata.pid;
-		rt_proc.deadline = kdata.time;
+		under_deadline = (timespec_to_ns(&(kdata.time)) * 95) / 100;
+		rt_proc.deadline = ns_to_timespec(under_deadline);
 		rt_proc.slow_enabled = false;
 		pr_debug("ioctl pid supplied: %d\n", rt_proc.pid);
 		/* pr_debug("ioctl deadline supplied: %d\n", rt_proc.deadline); */
@@ -1110,7 +1145,7 @@ int init_module(void)
 		c->id          = cpu;
 		c->function    = NULL;
 		c->period      = kt_period;
-		c->slow_rate   = 50;
+		c->slow_rate   = 0;
 #ifndef NO_PMU
 		c->miss        = NULL;
 		c->write       = NULL;
