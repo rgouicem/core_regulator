@@ -484,7 +484,7 @@ static int setup_procfs(void)
 {
 	int cpu;
 	struct core *c;
-	char name[6] = "core0";
+	char name[10] = "core0";
 	struct proc_dir_entry *info_file, *ctrl_file;
 
 	/* create procfs directory */
@@ -496,7 +496,8 @@ static int setup_procfs(void)
 	get_online_cpus();
 	for_each_online_cpu(cpu) {
 		c = per_cpu_ptr(core, cpu);
-		name[4] = '0' + cpu;
+		scnprintf(name, 10, "core%d", cpu);
+		/* name[4] = '0' + cpu; */
 		c->proc_entry = proc_create_data(name, 0444, proc_dir,
 						 &fops_seq, NULL);
 		if (c->proc_entry == NULL) {
