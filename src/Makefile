@@ -12,13 +12,13 @@ no_pmu:
 	KCFLAGS="-DNO_PMU" make -C $(KERNELDIR) M=$(PWD) modules
 
 arm:
-	KCFLAGS="-DNO_PMU" make CROSS_COMPILE=arm-linux-gnueabihf- ARCH=arm -C $(KERNELDIR_ARM) M=$(PWD) modules
+	KCFLAGS="-DARM -DNO_PMU" make CROSS_COMPILE=arm-linux-gnueabihf- ARCH=arm -C $(KERNELDIR_ARM) M=$(PWD) modules
 
 x86:
-	KCFLAGS="-DCORE2QUAD" make -C $(KERNELDIR) M=$(PWD) modules
+	KCFLAGS="-DCORE2QUAD -DNO_PMU" make -C $(KERNELDIR) M=$(PWD) modules
 
 clean:
 	make -C $(KERNELDIR) M=$(PWD) clean
 	rm -rf *~ *#
 
-.PHONY: all no_pmu clean arm
+.PHONY: all no_pmu clean arm x86

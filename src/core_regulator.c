@@ -455,8 +455,8 @@ static ssize_t write_ctrl_proc(struct file *file, const char __user *buffer,
 			s.event = SLOW;
 			s.event_value = slow_rate;
 			smp_call_function_single(cpu, add_event, &s, 1);
-			pr_debug("slowdown delays = %llu us\n",
-				 ((ktime_to_ns(c->period) / 1000) * c->slow_rate) / 100);
+			pr_debug("slowdown delays = %u us\n",
+				 (((int)ktime_to_ns(c->period) / 1000) * c->slow_rate) / 100);
 			if (!hrtimer_active(&(c->timer))) {
 				pr_debug("start timer %d\n", cpu);
 			        smp_call_function_single(cpu, start_hrtimer,
@@ -541,8 +541,22 @@ err:
 
 static void cleanup_procfs(void)
 {
+#ifdef ARM
+	int cpu;
+	char name[10];
+
+	get_online_cpus();
+	for_each_online_cpu(cpu) {
+		scnprintf(name, 10, "core%d", cpu);
+		remove_proc_entry(name, proc_dir);
+	}
+	put_online_cpus();
+	remove_proc_entry("info", proc_dir);
+	remove_proc_entry("control", proc_dir);
+	remove_proc_entry(PROCFS_DIRNAME, NULL);
+#else
 	proc_remove(proc_dir);
-	/* remove_proc_entry(PROCFS_DIRNAME, proc_dir); */
+#endif
 	free_page((unsigned long)info_buffer);
 }
 
@@ -969,8 +983,8 @@ static void slowdown_prof(void)
 
 	profile();
 	c->state = SLOWING_DOWN;
-	delay = ((ktime_to_ns(c->period) / 1000) * c->slow_rate) / 100;
-	pr_debug("slowdown delay = %llu ns\n", delay);
+	delay = (((int)ktime_to_ns(c->period) / 1000) * c->slow_rate) / 100;
+	//pr_debug("slowdown delay = %llu ns\n", delay);
 	udelay(delay);
 }
 
@@ -990,8 +1004,8 @@ static void slowdown(void)
 	u64 delay;
 
 	c->state = SLOWING_DOWN;
-	delay = ((ktime_to_ns(c->period) / 1000) * c->slow_rate) / 100;
-	pr_debug("slowdown delay = %llu ns\n", delay);
+	delay = (((int)ktime_to_ns(c->period) / 1000) * c->slow_rate) / 100;
+	//pr_debug("slowdown delay = %llu ns\n", delay);
 	udelay(delay);
 }
 
