@@ -335,7 +335,7 @@ static ssize_t write_ctrl_proc(struct file *file, const char __user *buffer,
 		goto err;
 	}
 
-	pr_debug("ioctl command: '%s'\n", kbuf);
+	pr_debug("procfs command: '%s'\n", kbuf);
 	
 	if (strncmp(kbuf, "profile ", strlen("profile ")) == 0) {
 		err = cpumask_parse_user(buffer + strlen("profile "), cpumask_len, &mask);
